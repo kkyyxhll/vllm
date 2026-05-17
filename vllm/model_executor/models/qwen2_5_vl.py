@@ -575,6 +575,14 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
+# Default number of leading singular components removed before computing
+# the residual-L2 score. Qwen2.5-VL hidden states are dominated by two
+# global directions (one DC term + one register-token style sink), so K=2
+# yields the cleanest residual; can be overridden via the env var
+# ``VLLM_GEOPRUNE_NUM_SINGULAR_VALUES``.
+_QWEN2_5_VL_GEOPRUNE_NUM_SINGULAR_VALUES = 2
+
+
 class Qwen2_5_VisionTransformer(nn.Module):
     def __init__(
         self,
@@ -923,15 +931,27 @@ class Qwen2_5_VisionTransformer(nn.Module):
         ``pre_layer_features`` has shape ``[seq_len, 1, hidden_size]`` (already
         ``unsqueeze(1)``-ed for the attention path) in window order.  We average
         over each ``spatial_merge_unit`` group of patches to align with the
-        merger output, then run :func:`compute_residual_l2_scores`.
+        merger output, then run :func:`compute_residual_l2_scores` with the
+        Qwen2.5-VL default ``K=2`` (overridable via the env var
+        ``VLLM_GEOPRUNE_NUM_SINGULAR_VALUES``).
         """
+        import os
+
         from vllm.model_executor.layers.attention.visual_token_pruning import (
             compute_residual_l2_scores,
         )
 
+        num_singular_values = int(
+            os.environ.get(
+                "VLLM_GEOPRUNE_NUM_SINGULAR_VALUES",
+                _QWEN2_5_VL_GEOPRUNE_NUM_SINGULAR_VALUES,
+            )
+        )
         feats = pre_layer_features.squeeze(1)
         feats = feats.view(-1, self.spatial_merge_unit, feats.shape[-1]).mean(dim=1)
-        return compute_residual_l2_scores(feats)
+        return compute_residual_l2_scores(
+            feats, num_singular_values=num_singular_values
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

@@ -516,6 +516,13 @@ class Qwen3_VisionPatchMerger(nn.Module):
         return out
 
 
+# Default number of leading singular components removed before computing
+# the residual-L2 score. Qwen3-VL / Qwen3.5-VL ViT hidden states are
+# dominated by a single global DC direction, so K=1 is a clean default;
+# overridable via the env var ``VLLM_GEOPRUNE_NUM_SINGULAR_VALUES``.
+_QWEN3_VL_GEOPRUNE_NUM_SINGULAR_VALUES = 1
+
+
 class Qwen3_VisionTransformer(nn.Module):
     def __init__(
         self,
@@ -849,14 +856,28 @@ class Qwen3_VisionTransformer(nn.Module):
         self,
         pre_layer_features: torch.Tensor,
     ) -> torch.Tensor:
-        """GeoPrune scoring: group-mean -> SVD deflation -> residual L2 norm."""
+        """GeoPrune scoring: group-mean -> SVD deflation -> residual L2 norm.
+
+        Uses the Qwen3-VL / Qwen3.5-VL default ``K=1`` (overridable via the
+        env var ``VLLM_GEOPRUNE_NUM_SINGULAR_VALUES``).
+        """
+        import os
+
         from vllm.model_executor.layers.attention.visual_token_pruning import (
             compute_residual_l2_scores,
         )
 
+        num_singular_values = int(
+            os.environ.get(
+                "VLLM_GEOPRUNE_NUM_SINGULAR_VALUES",
+                _QWEN3_VL_GEOPRUNE_NUM_SINGULAR_VALUES,
+            )
+        )
         feats = pre_layer_features.squeeze(1)
         feats = feats.view(-1, self.spatial_merge_unit, feats.shape[-1]).mean(dim=1)
-        return compute_residual_l2_scores(feats)
+        return compute_residual_l2_scores(
+            feats, num_singular_values=num_singular_values
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
