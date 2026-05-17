@@ -451,29 +451,16 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
-        return_attention_score: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        attn_result = self.attn(
+    ) -> torch.Tensor:
+        x = x + self.attn(
             self.norm1(x),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
-            return_attention_score=return_attention_score,
         )
-
-        if isinstance(attn_result, tuple):
-            attn_output, attention_score = attn_result
-        else:
-            attn_output = attn_result
-            attention_score = None
-
-        x = x + attn_output
         x = x + self.mlp(self.norm2(x))
-
-        if attention_score is not None:
-            return x, attention_score
         return x
 
 
@@ -821,28 +808,26 @@ class Qwen3_VisionTransformer(nn.Module):
         hidden_states = hidden_states + pos_embeds
         hidden_states = hidden_states.unsqueeze(1)
 
-        attention_score = None
+        # GeoPrune: snapshot the hidden states just before the chosen vision
+        # block.  Computing residual-L2 scores on those features lets us drop
+        # tokens without touching the attention kernel.
+        pre_layer_features: torch.Tensor | None = None
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
-            need_score = (
+            if (
                 self.extract_vit_attention_score
                 and layer_num == self.vit_attention_score_layer_index
-            )
+            ):
+                pre_layer_features = hidden_states.detach()
 
-            blk_result = blk(
+            hidden_states = blk(
                 hidden_states,
                 cu_seqlens=encoder_metadata["cu_seqlens"],
                 rotary_pos_emb_cos=encoder_metadata["rotary_pos_emb_cos"],
                 rotary_pos_emb_sin=encoder_metadata["rotary_pos_emb_sin"],
                 max_seqlen=encoder_metadata["max_seqlen"],
                 sequence_lengths=encoder_metadata.get("sequence_lengths"),
-                return_attention_score=need_score,
             )
-
-            if isinstance(blk_result, tuple):
-                hidden_states, attention_score = blk_result
-            else:
-                hidden_states = blk_result
 
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
@@ -855,10 +840,23 @@ class Qwen3_VisionTransformer(nn.Module):
             [hidden_states] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
 
-        if attention_score is not None:
-            score = attention_score.view(-1, self.spatial_merge_unit).mean(dim=1)
+        if pre_layer_features is not None:
+            score = self._compute_geoprune_scores(pre_layer_features)
             return hidden_states, score
         return hidden_states
+
+    def _compute_geoprune_scores(
+        self,
+        pre_layer_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """GeoPrune scoring: group-mean -> SVD deflation -> residual L2 norm."""
+        from vllm.model_executor.layers.attention.visual_token_pruning import (
+            compute_residual_l2_scores,
+        )
+
+        feats = pre_layer_features.squeeze(1)
+        feats = feats.view(-1, self.spatial_merge_unit, feats.shape[-1]).mean(dim=1)
+        return compute_residual_l2_scores(feats)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

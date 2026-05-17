@@ -371,8 +371,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
-        return_attention_score: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
         seq_len, batch_size, _ = x.shape
@@ -407,50 +406,20 @@ class Qwen2_5_VisionAttention(nn.Module):
         else:
             q, k, v = qkv.unbind(dim=2)
 
-        attention_score = None
-        if return_attention_score and self.attn.is_flash_attn_backend:
-            from vllm.model_executor.layers.attention.flash_attn_with_score import (
-                flash_attn_varlen_func_with_score,
-            )
-
-            q_3d = einops.rearrange(q, "b s h d -> (b s) h d")
-            k_3d = einops.rearrange(k, "b s h d -> (b s) h d")
-            v_3d = einops.rearrange(v, "b s h d -> (b s) h d")
-
-            max_seqlen_val = int(max_seqlen)
-            context_layer, attention_score = flash_attn_varlen_func_with_score(
-                q_3d,
-                k_3d,
-                v_3d,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen_val,
-                max_seqlen_k=max_seqlen_val,
-                dropout_p=0.0,
-                causal=False,
-                return_attention_score=True,
-            )
-            context_layer = einops.rearrange(
-                context_layer, "(b s) h d -> b s h d", b=batch_size
-            )
-        else:
-            context_layer = self.attn(
-                query=q,
-                key=k,
-                value=v,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                sequence_lengths=sequence_lengths,
-            )
+        context_layer = self.attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
 
         context_layer = einops.rearrange(
             context_layer, "b s h d -> s b (h d)", b=batch_size
         ).contiguous()
 
         output, _ = self.proj(context_layer)
-
-        if attention_score is not None:
-            return output, attention_score
         return output
 
 
@@ -902,7 +871,10 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         hidden_states = hidden_states.unsqueeze(1)
 
-        attention_score = None
+        # GeoPrune: snapshot the hidden states right before the chosen
+        # vision block so we can compute residual-L2 importance scores
+        # without changing the attention computation.
+        pre_layer_features: torch.Tensor | None = None
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
@@ -911,24 +883,21 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 cu_seqlens_now = cu_window_seqlens
                 max_seqlen_now = max_seqlen_window
 
-            need_score = (
+            if (
                 self.extract_vit_attention_score
                 and layer_num == self.vit_attention_score_layer_index
-            )
+            ):
+                # Detach so the snapshot does not retain the autograd graph
+                # of the previous blocks during inference.
+                pre_layer_features = hidden_states.detach()
 
-            blk_result = blk(
+            hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen_now,
-                return_attention_score=need_score,
             )
-
-            if isinstance(blk_result, tuple):
-                hidden_states, attention_score = blk_result
-            else:
-                hidden_states = blk_result
 
         # For Qwen2.5-VL-3B, float16 will overflow at last block
         # for long visual tokens sequences.
@@ -939,11 +908,30 @@ class Qwen2_5_VisionTransformer(nn.Module):
         hidden_states = self.merger(hidden_states)
         hidden_states = hidden_states[reverse_indices, :]
 
-        if attention_score is not None:
-            score = attention_score.view(-1, self.spatial_merge_unit).mean(dim=1)
+        if pre_layer_features is not None:
+            score = self._compute_geoprune_scores(pre_layer_features)
             score = score[reverse_indices]
             return hidden_states, score
         return hidden_states
+
+    def _compute_geoprune_scores(
+        self,
+        pre_layer_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """GeoPrune scoring: group-mean -> SVD deflation -> residual L2 norm.
+
+        ``pre_layer_features`` has shape ``[seq_len, 1, hidden_size]`` (already
+        ``unsqueeze(1)``-ed for the attention path) in window order.  We average
+        over each ``spatial_merge_unit`` group of patches to align with the
+        merger output, then run :func:`compute_residual_l2_scores`.
+        """
+        from vllm.model_executor.layers.attention.visual_token_pruning import (
+            compute_residual_l2_scores,
+        )
+
+        feats = pre_layer_features.squeeze(1)
+        feats = feats.view(-1, self.spatial_merge_unit, feats.shape[-1]).mean(dim=1)
+        return compute_residual_l2_scores(feats)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

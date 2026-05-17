@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for visual token pruning functions and config integration."""
+"""Unit tests for GeoPrune scoring and pruning utilities plus config wiring."""
 
 import pytest
 import torch
 
 from vllm.model_executor.layers.attention.visual_token_pruning import (
+    compute_residual_l2_scores,
+    power_iteration,
     prune_visual_tokens_dominant_only,
-    prune_visual_tokens_with_merge,
 )
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -17,11 +19,11 @@ from vllm.model_executor.layers.attention.visual_token_pruning import (
 
 @pytest.fixture
 def sample_embeddings():
-    """100 tokens with hidden_size=64, deterministic scores."""
+    """100 tokens with hidden_size=64 and ascending scores."""
     torch.manual_seed(42)
-    N, D = 100, 64
-    embeddings = torch.randn(N, D)
-    scores = torch.arange(N, dtype=torch.float32)  # 0..99, token 99 highest
+    num_tokens, dim = 100, 64
+    embeddings = torch.randn(num_tokens, dim)
+    scores = torch.arange(num_tokens, dtype=torch.float32)
     return embeddings, scores
 
 
@@ -29,9 +31,9 @@ def sample_embeddings():
 def small_embeddings():
     """10 tokens with hidden_size=16."""
     torch.manual_seed(0)
-    N, D = 10, 16
-    embeddings = torch.randn(N, D)
-    scores = torch.arange(N, dtype=torch.float32)
+    num_tokens, dim = 10, 16
+    embeddings = torch.randn(num_tokens, dim)
+    scores = torch.arange(num_tokens, dtype=torch.float32)
     return embeddings, scores
 
 
@@ -50,7 +52,6 @@ class TestDominantOnly:
 
     def test_prune_half(self, sample_embeddings):
         emb, scores = sample_embeddings
-        # pruning_rate=0.5 means prune 50%, keep 50 tokens
         pruned, indices = prune_visual_tokens_dominant_only(emb, scores, 0.5)
         assert pruned.shape[0] == 50
         assert pruned.shape[1] == emb.shape[1]
@@ -58,14 +59,12 @@ class TestDominantOnly:
 
     def test_keeps_highest_scoring_tokens(self, sample_embeddings):
         emb, scores = sample_embeddings
-        # pruning_rate=0.6 means prune 60%, keep 40 tokens
+        # pruning_rate=0.6 keeps the top-40 scoring tokens (indices 60..99).
         _, indices = prune_visual_tokens_dominant_only(emb, scores, 0.6)
-        # scores = 0..99, top 40 should be indices 60..99
         assert indices.min().item() >= 60
 
     def test_indices_sorted(self, sample_embeddings):
         emb, scores = sample_embeddings
-        # pruning_rate=0.7 means prune 70%, keep 30 tokens
         _, indices = prune_visual_tokens_dominant_only(emb, scores, 0.7)
         assert torch.all(indices[1:] > indices[:-1])
 
@@ -76,124 +75,124 @@ class TestDominantOnly:
 
     def test_at_least_one_token_kept(self, sample_embeddings):
         emb, scores = sample_embeddings
-        # pruning_rate=0.999 means prune 99.9%, but at least 1 token kept
-        pruned, indices = prune_visual_tokens_dominant_only(emb, scores, 0.999)
+        pruned, _ = prune_visual_tokens_dominant_only(emb, scores, 0.999)
         assert pruned.shape[0] >= 1
 
     def test_very_small_input(self):
         emb = torch.randn(3, 8)
         scores = torch.tensor([1.0, 3.0, 2.0])
-        # pruning_rate=0.5 means prune 50%, keep int(3 * 0.5) = 1
         pruned, indices = prune_visual_tokens_dominant_only(emb, scores, 0.5)
-        # int(3 * 0.5) = 1, keep at least 1
+        # int(3 * (1 - 0.5)) = 1, keeps the highest-scoring token (index 1).
         assert pruned.shape[0] == 1
-        assert indices.item() == 1  # token with score 3.0
+        assert indices.item() == 1
+
+    def test_single_token_short_circuit(self):
+        emb = torch.randn(1, 8)
+        scores = torch.tensor([42.0])
+        pruned, indices = prune_visual_tokens_dominant_only(emb, scores, 0.5)
+        assert pruned.shape[0] == 1
+        assert torch.equal(indices, torch.tensor([0]))
+
+    def test_mismatched_scores_raise(self, sample_embeddings):
+        emb, _ = sample_embeddings
+        wrong_scores = torch.zeros(emb.shape[0] + 1)
+        with pytest.raises(ValueError):
+            prune_visual_tokens_dominant_only(emb, wrong_scores, 0.5)
 
 
 # ===================================================================
-# Tests for prune_visual_tokens_with_merge
+# Tests for power_iteration / compute_residual_l2_scores
 # ===================================================================
 
 
-class TestWithMerge:
-    def test_no_pruning_rate_0(self, sample_embeddings):
-        emb, scores = sample_embeddings
-        pruned, indices = prune_visual_tokens_with_merge(emb, scores, 0.0)
-        assert pruned.shape == emb.shape
-        assert torch.equal(pruned, emb)
+class TestPowerIteration:
+    def test_recovers_top_singular_triple(self):
+        torch.manual_seed(0)
+        # Build a deterministic rank-1 matrix with known sigma.
+        u_true = torch.randn(32)
+        v_true = torch.randn(8)
+        u_true = u_true / u_true.norm()
+        v_true = v_true / v_true.norm()
+        sigma_true = 5.0
+        matrix = sigma_true * torch.outer(u_true, v_true)
 
-    def test_output_shape(self, sample_embeddings):
-        emb, scores = sample_embeddings
-        # pruning_rate=0.6 means prune 60%, keep 40% -> keep_ratio=0.4
-        pruning_rate = 0.6
-        merge_ratio = 0.1
-        pruned, indices = prune_visual_tokens_with_merge(
-            emb, scores, pruning_rate, merge_ratio
+        sigma, v, u = power_iteration(matrix, num_iters=50)
+
+        assert sigma.item() == pytest.approx(sigma_true, rel=1e-4)
+        # Eigenvectors may flip sign; compare absolute cosine similarity.
+        assert abs(torch.dot(v, v_true).item()) == pytest.approx(1.0, abs=1e-4)
+        assert abs(torch.dot(u, u_true).item()) == pytest.approx(1.0, abs=1e-4)
+
+
+class TestResidualL2Scores:
+    def test_shape_and_dtype(self):
+        torch.manual_seed(1)
+        feats = torch.randn(20, 16)
+        scores = compute_residual_l2_scores(feats, num_singular_values=2)
+        assert scores.shape == (20,)
+        assert scores.dtype == torch.float32
+        assert (scores >= 0).all()
+
+    def test_zero_singular_values_equals_raw_norm(self):
+        torch.manual_seed(2)
+        feats = torch.randn(15, 8)
+        scores = compute_residual_l2_scores(feats, num_singular_values=0)
+        assert torch.allclose(scores, feats.float().norm(dim=-1), atol=1e-5)
+
+    def test_rank_one_residual_is_zero(self):
+        torch.manual_seed(3)
+        # A rank-1 matrix is fully captured by the first singular component;
+        # deflation should drive every residual norm essentially to zero.
+        u = torch.randn(32)
+        v = torch.randn(16)
+        feats = torch.outer(u, v)
+        scores = compute_residual_l2_scores(
+            feats, num_singular_values=1, num_power_iters=50
         )
-        keep_ratio = 1.0 - pruning_rate  # 0.4
-        dominant_num = max(1, int(100 * (keep_ratio - merge_ratio)))  # 30
-        anchor_num = max(1, int(100 * merge_ratio))  # 10
-        expected_total = dominant_num + anchor_num  # 40
-        assert pruned.shape[0] == expected_total
-        assert indices.shape[0] == expected_total
+        assert scores.max().item() < 1e-3
 
-    def test_indices_sorted(self, sample_embeddings):
-        emb, scores = sample_embeddings
-        # pruning_rate=0.6 -> keep 40%
-        _, indices = prune_visual_tokens_with_merge(emb, scores, 0.6)
-        assert torch.all(indices[1:] > indices[:-1])
+    def test_ranks_match_known_signal(self):
+        """Tokens with stronger residual signal must score higher."""
+        torch.manual_seed(4)
+        # Construct features as `c * v_common + alpha_i * w_i`, where
+        # `v_common` is a shared DC direction and `alpha_i` is the
+        # per-token residual energy.
+        dim = 32
+        num_tokens = 16
+        v_common = torch.randn(dim)
+        w = torch.randn(num_tokens, dim)
+        w = w - (w @ v_common.unsqueeze(-1) / v_common.dot(v_common)) * v_common
+        alpha = torch.linspace(0.1, 1.6, num_tokens)
+        feats = 10.0 * v_common.unsqueeze(0).expand(num_tokens, dim) + alpha.unsqueeze(
+            -1
+        ) * w
 
-    def test_dominant_tokens_preserved(self, sample_embeddings):
-        """Dominant tokens should keep their original embeddings."""
-        emb, scores = sample_embeddings
-        pruning_rate, merge_ratio = 0.6, 0.1
-        pruned, indices = prune_visual_tokens_with_merge(
-            emb, scores, pruning_rate, merge_ratio
-        )
+        scores = compute_residual_l2_scores(feats, num_singular_values=1)
+        ranking = scores.argsort()
+        expected = alpha.argsort()
+        # The induced ordering should match the residual energies exactly.
+        assert torch.equal(ranking, expected)
 
-        keep_ratio = 1.0 - pruning_rate  # 0.4
-        dominant_num = int(100 * (keep_ratio - merge_ratio))
-        # Get which of the kept indices are dominant (top-30 by score)
-        _, top_indices = torch.topk(scores, dominant_num, sorted=False)
-        top_set = set(top_indices.tolist())
+    def test_rejects_non_2d(self):
+        with pytest.raises(ValueError):
+            compute_residual_l2_scores(torch.randn(8))
 
-        for i, idx in enumerate(indices.tolist()):
-            if idx in top_set:
-                # Dominant tokens should be unchanged
-                assert torch.allclose(pruned[i], emb[idx])
 
-    def test_anchor_tokens_modified(self, sample_embeddings):
-        """Anchor tokens should differ from originals (they got merged info)."""
-        emb, scores = sample_embeddings
-        pruning_rate, merge_ratio = 0.6, 0.1
-        pruned, indices = prune_visual_tokens_with_merge(
-            emb, scores, pruning_rate, merge_ratio
-        )
+# ===================================================================
+# End-to-end: scoring + topk on the same features
+# ===================================================================
 
-        keep_ratio = 1.0 - pruning_rate  # 0.4
-        dominant_num = int(100 * (keep_ratio - merge_ratio))
-        _, top_indices = torch.topk(scores, dominant_num, sorted=False)
-        top_set = set(top_indices.tolist())
 
-        anchor_found = False
-        for i, idx in enumerate(indices.tolist()):
-            if idx not in top_set:
-                anchor_found = True
-                # Anchor tokens should be modified (original + aggregated)
-                if not torch.allclose(pruned[i], emb[idx]):
-                    break
-        assert anchor_found, "Should have at least one anchor token"
-
-    def test_fallback_when_dominant_ratio_negative(self, sample_embeddings):
-        """When keep_ratio <= merge_ratio, should fallback to dominant_only."""
-        emb, scores = sample_embeddings
-        # pruning_rate=0.95 -> keep_ratio=0.05, which <= merge_ratio=0.1
-        pruned, indices = prune_visual_tokens_with_merge(
-            emb, scores, pruning_rate=0.95, merge_ratio=0.1
-        )
-        # Fallback: dominant_only with pruning_rate=0.95 -> keep 5 tokens
-        assert pruned.shape[0] == max(1, int(100 * 0.05))
-
-    def test_small_input(self, small_embeddings):
-        emb, scores = small_embeddings
-        # pruning_rate=0.5 -> keep_ratio=0.5
-        pruned, indices = prune_visual_tokens_with_merge(
-            emb, scores, pruning_rate=0.5, merge_ratio=0.1
-        )
-        # dominant = int(10*0.4)=4, anchor = int(10*0.1)=1 -> 5 total
-        assert pruned.shape[0] == 5
-        assert pruned.shape[1] == emb.shape[1]
-
-    def test_merge_ratio_zero_equivalent_to_dominant(self, sample_embeddings):
-        emb, scores = sample_embeddings
-        # pruning_rate=0.6 -> keep_ratio=0.4
-        pruned_merge, idx_merge = prune_visual_tokens_with_merge(
-            emb, scores, pruning_rate=0.6, merge_ratio=0.0
-        )
-        # merge_ratio=0.0 -> dominant_ratio=0.4, anchor_num=0
-        # But max(1, int(100*0.0))=1, so still 1 anchor
-        # This is fine - just verify it doesn't crash
-        assert pruned_merge.shape[0] > 0
+def test_geoprune_end_to_end():
+    torch.manual_seed(5)
+    feats = torch.randn(64, 96)
+    scores = compute_residual_l2_scores(feats, num_singular_values=1)
+    pruned, indices = prune_visual_tokens_dominant_only(feats, scores, pruning_rate=0.6)
+    assert pruned.shape[0] == int(64 * 0.4)
+    assert torch.equal(indices, indices.sort().values)
+    # The selected tokens should be the ones with the largest residual scores.
+    expected = scores.topk(int(64 * 0.4)).indices.sort().values
+    assert torch.equal(indices, expected)
 
 
 # ===================================================================
@@ -205,7 +204,6 @@ class TestMultiModalConfigAutoEnable:
     def test_auto_enable_extract_score(self):
         from vllm.config.multimodal import MultiModalConfig
 
-        # image_pruning_rate=0.6 means prune 60% of tokens
         cfg = MultiModalConfig(image_pruning_rate=0.6)
         assert cfg.extract_vit_attention_score is True
 
@@ -218,7 +216,6 @@ class TestMultiModalConfigAutoEnable:
     def test_no_auto_enable_when_rate_0(self):
         from vllm.config.multimodal import MultiModalConfig
 
-        # image_pruning_rate=0.0 means no pruning
         cfg = MultiModalConfig(image_pruning_rate=0.0)
         assert cfg.extract_vit_attention_score is False
 
@@ -257,23 +254,19 @@ class TestPruningOnGPU:
     def test_dominant_only_cuda(self):
         emb = torch.randn(100, 64, device="cuda")
         scores = torch.randn(100, device="cuda")
-        # pruning_rate=0.5 -> keep 50 tokens
-        pruned, indices = prune_visual_tokens_dominant_only(emb, scores, 0.5)
+        pruned, _ = prune_visual_tokens_dominant_only(emb, scores, 0.5)
         assert pruned.device.type == "cuda"
         assert pruned.shape[0] == 50
 
-    def test_with_merge_cuda(self):
-        emb = torch.randn(100, 64, device="cuda")
-        scores = torch.randn(100, device="cuda")
-        # pruning_rate=0.6 -> keep_ratio=0.4, merge_ratio=0.1
-        pruned, indices = prune_visual_tokens_with_merge(emb, scores, 0.6, 0.1)
-        assert pruned.device.type == "cuda"
-        expected = int(100 * 0.3) + int(100 * 0.1)
-        assert pruned.shape[0] == expected
+    def test_residual_scores_cuda(self):
+        feats = torch.randn(64, 32, device="cuda")
+        scores = compute_residual_l2_scores(feats, num_singular_values=1)
+        assert scores.device.type == "cuda"
+        assert scores.shape == (64,)
 
-    def test_bfloat16_support(self):
-        emb = torch.randn(100, 64, device="cuda", dtype=torch.bfloat16)
-        scores = torch.randn(100, device="cuda")
-        # pruning_rate=0.6 -> keep 40%
-        pruned, _ = prune_visual_tokens_with_merge(emb, scores, 0.6)
-        assert pruned.dtype == torch.bfloat16
+    def test_bfloat16_features(self):
+        feats = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+        scores = compute_residual_l2_scores(feats, num_singular_values=1)
+        # Scores are always returned in float32 for stable ranking.
+        assert scores.dtype == torch.float32
+        assert scores.shape == (64,)
